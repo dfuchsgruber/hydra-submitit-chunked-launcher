@@ -4,7 +4,7 @@ This launcher, in contrast to the [`standard`](https://github.com/facebookresear
 
 # Installation
 
-1. Clone the repository: ```git clone```
+1. Clone the repository: ```git clone https://github.com/WodkaRHR/hydra_submitit_chunked_lancher.git```
 2. Navigate into the project directory: `cd hydra_submitit_chunked_launcher`
 3. Install using pip: ```pip install .```
 
