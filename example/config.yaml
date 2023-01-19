@@ -1,0 +1,9 @@
+defaults:
+  - override hydra/launcher: submitit_chunked_slurm
+
+hydra:
+  launcher:
+    max_num_jobs_per_node: 2
+
+
+task: ???
