@@ -3,6 +3,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+from joblib import Parallel, delayed
 
 from hydra.core.singleton import Singleton
 from hydra.core.utils import JobReturn, filter_overrides, run_job, setup_globals
@@ -30,7 +31,7 @@ class BaseSubmititLauncher(Launcher):
         self.task_function: Optional[TaskFunction] = None
         self.sweep_configs: Optional[TaskFunction] = None
         self.hydra_context: Optional[HydraContext] = None
-
+        
     def setup(
         self,
         *,
@@ -49,26 +50,31 @@ class BaseSubmititLauncher(Launcher):
         job_nums: Sequence[int],
         job_ids: Sequence[str],
         singleton_states: Sequence[Dict[type, Singleton]],
+        joblib_config: Dict[str, str]
     ) -> Optional[JobReturn]:
-        # lazy import to ensure plugin discovery remains fast
-        import submitit
 
         assert self.hydra_context is not None
         assert self.config is not None
         assert self.task_function is not None
+        
+        # Use joblib with loky backend for multiple processes per job
+        
+        assert len(sweep_overrides_list) == len(job_dir_keys) == len(job_nums) == len(job_ids) == len(singleton_states)
+        
+        runs = Parallel(**joblib_config)(
+            delayed(self._call_experiment)(*args) for args in
+            zip(sweep_overrides_list, job_dir_keys, job_nums, job_ids, singleton_states)
+        )
+        assert isinstance(runs, List)   
+        for run in runs:
+            assert isinstance(run, JobReturn)
+        return runs
 
-        job_environment = submitit.JobEnvironment()
-        task_idx = job_environment.global_rank
+    def _call_experiment(self, sweep_overrides, job_dir_key, job_num, job_id, singleton_state):
+        # lazy import to ensure plugin discovery remains fast
+        import submitit
         
-        if task_idx >= len(sweep_overrides_list):
-            # If the number of jobs is not divisible by the number of tasks per job
-            # some tasks will have nothing to do
-            return None
-        
-        sweep_overrides, job_dir_key, job_num, job_id, singleton_state = \
-            sweep_overrides_list[task_idx], job_dir_keys[task_idx], job_nums[task_idx], \
-            job_ids[task_idx], singleton_states[task_idx]
-            
+        job_environment = submitit.JobEnvironment() 
         Singleton.set_state(singleton_state)
         setup_globals()
         sweep_config = self.hydra_context.config_loader.load_sweep_config(
@@ -107,17 +113,17 @@ class BaseSubmititLauncher(Launcher):
         assert num_jobs > 0
         params = self.params
         
-        if params['tasks_per_node'] != 1:
-            raise RuntimeError(f'Chunked submitit launcher uses different tasks per node.\n' +
-                               'Your code should not use that functionality but sets\n' +
-                                f'"hydra.launcher.tasks_per_node" to {params["tasks_per_node"]}.\n' +
-                                "Use a number of 1 instead and make your code not rely on mutliple tasks.")
-        else:
-            chunk_size = params['max_num_jobs_per_node']
-            params['tasks_per_node'] = chunk_size
+        chunk_size = params['max_experiments_per_job']
         # build executor
         init_params = {"folder": self.params["submitit_folder"]}
         specific_init_keys = {"max_num_timeout"}
+
+        # Validate the joblib config
+        joblib_config = params['joblib']
+        if joblib_config['backend'] != 'loky':
+            raise ValueError(f'Hydra is only compatible with the loky joblib backend, not {joblib_config["backend"]}')
+        if joblib_config['n_jobs'] > 0 and joblib_config['n_jobs'] < chunk_size:
+            logging.warn(f'Running {chunk_size} experiments per job but only providing {joblib_config["n_jobs"]} processes via "n_jobs" to joblib backend.')
 
         init_params.update(
             **{
@@ -126,7 +132,7 @@ class BaseSubmititLauncher(Launcher):
                 if x in specific_init_keys
             }
         )
-        init_keys = specific_init_keys | {"submitit_folder", "max_num_jobs_per_node"}
+        init_keys = specific_init_keys | {"submitit_folder", "max_experiments_per_job", "joblib"}
         executor = submitit.AutoExecutor(cluster=self._EXECUTOR, **init_params)
 
         # specify resources/parameters
@@ -164,9 +170,10 @@ class BaseSubmititLauncher(Launcher):
             )
         
         assert chunk_size > 0 and isinstance(chunk_size, int), f'Invalid chunk size {chunk_size}'
-        jobs = executor.map_array(self, *([params[i : i + chunk_size] for i in range(0, len(params), chunk_size)] for params in zip(*job_params)))
-        return [j.results()[0] for j in jobs if j]
-        #return sum((j.results()[0] for j in jobs), start=[])
+        jobs = executor.map_array(self, *([params[i : i + chunk_size] for i in range(0, len(params), chunk_size)] for params in zip(*job_params)),
+                                  [joblib_config for i in range(0, len(params), chunk_size)])
+        # return [j.results()[0] for j in jobs if j]
+        return sum((j.results()[0] for j in jobs), start=[])
 
 
 class LocalChunkedLauncher(BaseSubmititLauncher):
